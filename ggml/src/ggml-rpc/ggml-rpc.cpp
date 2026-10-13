@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
+#include <cstdarg>
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
@@ -86,6 +87,51 @@ enum rpc_cmd {
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
+
+// Optional per-command timing trace for rpc-server (dat300). Enabled by GGML_RPC_TRACE=<file>.
+// One CSV line per command: wall-clock start (us since epoch), idle time waiting for the command,
+// duration (receive payload + execute + send reply), command name, and command-specific details.
+static const char * rpc_cmd_name(uint8_t cmd) {
+    static const char * names[] = {
+        "ALLOC_BUFFER", "GET_ALIGNMENT", "GET_MAX_SIZE", "BUFFER_GET_BASE", "FREE_BUFFER", "BUFFER_CLEAR",
+        "SET_TENSOR", "SET_TENSOR_HASH", "GET_TENSOR", "COPY_TENSOR", "GRAPH_COMPUTE", "GET_DEVICE_MEMORY",
+        "INIT_TENSOR", "GET_ALLOC_SIZE", "HELLO", "DEVICE_COUNT", "GRAPH_RECOMPUTE", "MEMSET_TENSOR",
+        "SET_TENSOR_2D", "GET_TENSOR_2D", "COMM_INIT", "COMM_ALLREDUCE", "COMM_FREE", "NONE",
+    };
+    return cmd < sizeof(names)/sizeof(names[0]) ? names[cmd] : "UNKNOWN";
+}
+struct rpc_trace {
+    FILE * f = nullptr;
+    char   detail[160] = {};
+    rpc_trace() {
+        const char * path = std::getenv("GGML_RPC_TRACE");
+        if (path != nullptr && path[0] != '\0') {
+            f = fopen(path, "w");
+            if (f != nullptr) {
+                setvbuf(f, nullptr, _IOLBF, 0);   // line-buffered: complete lines even if the server is killed
+                fprintf(f, "start_us,idle_us,dur_us,cmd,detail\n");
+            }
+        }
+    }
+    ~rpc_trace() { if (f) { fclose(f); } }
+    static int64_t now_us() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+    void set_detail(const char * fmt, ...) {
+        if (f == nullptr) { return; }
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(detail, sizeof(detail), fmt, args);
+        va_end(args);
+    }
+    void write(int64_t start, int64_t idle, int64_t dur, uint8_t cmd) {
+        if (f == nullptr) { return; }
+        fprintf(f, "%lld,%lld,%lld,%s,%s\n", (long long) start, (long long) idle, (long long) dur, rpc_cmd_name(cmd), detail);
+        detail[0] = '\0';
+    }
+};
+static rpc_trace g_rpc_trace;
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
@@ -2270,12 +2316,15 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     };
 
+    int64_t tr_sync = 0, tr_xchg = 0, tr_local = 0;   // trace: time waiting for compute / network exchange / local copies+add
     for (uint32_t k = 1; k < state.world; k <<= 1) {
         const uint32_t p = state.rank ^ k;
         socket_t * peer = state.peers[p].get();
 
         // wait for the pending subgraph (or previous step's reduction) that produced this partial
+        int64_t tr0 = g_rpc_trace.f ? rpc_trace::now_us() : 0;
         ggml_backend_synchronize(backend);
+        if (g_rpc_trace.f) { const int64_t t = rpc_trace::now_us(); tr_sync += t - tr0; tr0 = t; }
 
         ggml_tensor * t_wire_send = nullptr;
         ggml_tensor * t_wire_recv = nullptr;
@@ -2289,6 +2338,7 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
             ggml_backend_tensor_get(t_dst, state.send_buf.data(), 0, wire_bytes);
         }
 
+        if (g_rpc_trace.f) { const int64_t t = rpc_trace::now_us(); tr_local += t - tr0; tr0 = t; }
         // small (decode-sized) payloads fit in the socket buffers, so both ranks send first and then
         // receive: one network latency per step instead of two. Large payloads keep the ordered exchange
         // (lower rank sends first) so they cannot deadlock.
@@ -2309,6 +2359,7 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
             }
         }
 
+        if (g_rpc_trace.f) { const int64_t t = rpc_trace::now_us(); tr_xchg += t - tr0; tr0 = t; }
         ggml_tensor * t_peer = new_scratch_tensor(t_dst->type, wire_bf16 ? (size_t) ne*4 : 0);
         ggml_tensor * t_cast = nullptr;
         if (wire_bf16) {
@@ -2331,7 +2382,10 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         } else {
             compute_nodes(t_red, nullptr);
         }
+        if (g_rpc_trace.f) { tr_local += rpc_trace::now_us() - tr0; }
     }
+    g_rpc_trace.set_detail("bytes=%zu steps=%u wait_compute_us=%lld exchange_us=%lld local_us=%lld",
+        wire_bytes, (unsigned) __builtin_ctz(state.world), (long long) tr_sync, (long long) tr_xchg, (long long) tr_local);
     return true;
 }
 
@@ -2402,6 +2456,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
+    int64_t trace_prev_end = rpc_trace::now_us();
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {
             break;
@@ -2411,6 +2466,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
         }
+        const int64_t trace_start = g_rpc_trace.f ? rpc_trace::now_us() : 0;
         switch (cmd) {
             case RPC_CMD_HELLO: {
                 // HELLO command is handled above
@@ -2535,6 +2591,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.set_tensor(input)) {
                     return;
                 }
+                g_rpc_trace.set_detail("bytes=%zu", input.size());
                 break;
             }
             case RPC_CMD_SET_TENSOR_2D: {
@@ -2594,6 +2651,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.get_tensor(request, response)) {
                     return;
                 }
+                g_rpc_trace.set_detail("bytes=%zu", response.size());
                 if (!send_msg(sock, response.data(), response.size())) {
                     return;
                 }
@@ -2620,6 +2678,11 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 if (!server.graph_compute(input)) {
                     return;
+                }
+                if (g_rpc_trace.f && input.size() >= 2*sizeof(uint32_t) + sizeof(uint64_t)) {
+                    // | device (4) | uid (8) | n_nodes (4) | ...
+                    uint32_t n_nodes; memcpy(&n_nodes, input.data() + sizeof(uint32_t) + sizeof(uint64_t), sizeof(n_nodes));
+                    g_rpc_trace.set_detail("nodes=%u", n_nodes);
                 }
                 break;
             }
@@ -2685,6 +2748,11 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
             }
+        }
+        if (g_rpc_trace.f) {
+            const int64_t end = rpc_trace::now_us();
+            g_rpc_trace.write(trace_start, trace_start - trace_prev_end, end - trace_start, cmd);
+            trace_prev_end = end;
         }
     }
 }
