@@ -11,6 +11,7 @@
 #else
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
+#  include <sys/select.h>
 #  include <sys/types.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
@@ -712,6 +713,19 @@ socket_ptr socket_t::accept() {
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
 }
 
+socket_ptr socket_t::accept(int timeout_ms) {
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(pimpl->fd, &readfds);
+    struct timeval tv;
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    if (select((int) pimpl->fd + 1, &readfds, NULL, NULL, &tv) <= 0) {
+        return nullptr;
+    }
+    return accept();
+}
+
 socket_ptr socket_t::create_server(const char * host, int port) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (!is_valid_fd(sockfd)) {
@@ -733,7 +747,8 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
         return nullptr;
     }
-    if (listen(sockfd, 1) < 0) {
+    // backlog > 1: with the comm full mesh up to world-1 ranks connect to the same server at once
+    if (listen(sockfd, 64) < 0) {
         return nullptr;
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));

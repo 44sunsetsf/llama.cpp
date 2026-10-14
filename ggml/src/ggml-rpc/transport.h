@@ -21,6 +21,8 @@ struct socket_t {
     bool flush();
 
     socket_ptr accept();
+    // accept() that gives up after timeout_ms milliseconds (returns nullptr)
+    socket_ptr accept(int timeout_ms);
 
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);

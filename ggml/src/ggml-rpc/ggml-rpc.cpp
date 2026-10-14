@@ -271,6 +271,7 @@ struct rpc_msg_get_tensor_2d_req {
 
 #define RPC_COMM_MAX_WORLD 16
 #define RPC_COMM_CONCURRENT_MAX (32*1024)
+#define RPC_COMM_AG_AUTO_MAX    (32*1024)   // auto: all-gather while (world-1) x payload stays this small
 struct rpc_msg_comm_init_req {
     uint32_t device;
     uint32_t rank;
@@ -283,8 +284,15 @@ struct rpc_msg_comm_init_rsp {
     uint8_t ok;
 };
 
+// small-payload allreduce algorithm, chosen by the client (GGML_RPC_COMM_ALGO) so all ranks agree
+enum rpc_comm_algo : uint32_t {
+    RPC_COMM_ALGO_AUTO = 0,   // all-gather for 2 ranks or tiny payloads, recursive doubling otherwise
+    RPC_COMM_ALGO_RD   = 1,   // recursive doubling: log2(world) steps, one partner per step
+    RPC_COMM_ALGO_AG   = 2,   // one-shot all-gather: 1 step, send to all world-1 ranks at once
+};
 struct rpc_msg_comm_allreduce_req {
     uint32_t   device;
+    uint32_t   algo;      // rpc_comm_algo
     rpc_tensor tensor;
 };
 
@@ -2178,13 +2186,11 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     }
     const uint32_t rank = request.rank;
     std::vector<socket_ptr> peers(world);
-    // Recursive doubling: at step k this rank exchanges with rank ^ k.
-    // The lower rank of each pair accepts, the higher one connects. Every rank first starts listening,
-    // so connects only wait on the backlog and the highest rank (which only connects) unblocks everyone.
-    uint32_t n_accept = 0;
-    for (uint32_t k = 1; k < world; k <<= 1) {
-        n_accept += (rank ^ k) > rank;
-    }
+    // Every rank first starts listening, so connects only wait on the backlog and the highest rank
+    // (which only connects) unblocks everyone.
+    // Full mesh: the lower rank of every pair accepts, the higher one connects. The one-shot
+    // all-gather (small payloads) talks to every rank; recursive doubling (large payloads) to rank ^ k.
+    const uint32_t n_accept = world - 1 - rank;
     socket_ptr srv;
     if (n_accept > 0) {
         srv = socket_t::create_server("0.0.0.0", request.port[rank]);
@@ -2206,11 +2212,7 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
         return ok;
     };
     // connect to lower partners
-    for (uint32_t k = 1; k < world; k <<= 1) {
-        const uint32_t p = rank ^ k;
-        if (p > rank) {
-            continue;
-        }
+    for (uint32_t p = 0; p < rank; p++) {
         const std::string host(request.host[p], strnlen(request.host[p], sizeof(request.host[p])));
         // the partner blocks in accept() until we arrive, so wait as long as it plausibly takes for every
         // rank to receive its COMM_INIT (it can queue behind weight uploads on a busy head)
@@ -2230,7 +2232,8 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     }
     // accept higher partners (in any order; they announce their rank)
     for (uint32_t i = 0; i < n_accept; i++) {
-        socket_ptr sock = srv->accept();
+        // the connecting side retries for 120 s; give up a bit later so a failed rank cannot hang the others
+        socket_ptr sock = srv->accept(130000);
         uint32_t peer_rank = 0;
         if (sock == nullptr || !sock->recv_data(&peer_rank, sizeof(peer_rank)) || peer_rank >= world ||
                 peers[peer_rank] != nullptr || !handshake(sock, false)) {
@@ -2278,6 +2281,68 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     if (nbytes == 0) {
         return true;
     }
+    // Small (decode-sized) f32 partials in host memory: exchange and sum directly in host memory
+    // (no extra copies and no separate ADD graph). Both ranks of a pair send first and then receive,
+    // since small payloads fit in the socket buffers.
+    //  - all-gather (AG): every rank sends its partial to all others at once and sums all partials in
+    //    rank order: 1 network latency, but (world-1) x bytes leave each node.
+    //  - recursive doubling (RD): log2(world) steps with one partner each; a+b == b+a exactly, so all
+    //    ranks still end with identical results.
+    if (t_dst->type == GGML_TYPE_F32 && nbytes <= RPC_COMM_CONCURRENT_MAX && ggml_backend_buffer_is_host(t_dst->buffer)) {
+        bool ag = request.algo == RPC_COMM_ALGO_AG;
+        if (request.algo == RPC_COMM_ALGO_AUTO) {
+            ag = state.world == 2 || (state.world - 1) * nbytes <= RPC_COMM_AG_AUTO_MAX;
+        }
+        int64_t tr0 = g_rpc_trace.f ? rpc_trace::now_us() : 0;
+        ggml_backend_synchronize(backend);
+        int64_t tr_sync = g_rpc_trace.f ? rpc_trace::now_us() - tr0 : 0, tr_xchg = 0, tr_local = 0;
+        float * x = (float *) t_dst->data;
+        if (ag) {
+            state.recv_buf.resize((size_t) state.world * nbytes);
+            int64_t t1 = g_rpc_trace.f ? rpc_trace::now_us() : 0;
+            for (uint32_t p = 0; p < state.world; p++) {
+                if (p != state.rank && (!state.peers[p]->send_data(x, nbytes) || !state.peers[p]->flush())) {
+                    return false;
+                }
+            }
+            for (uint32_t p = 0; p < state.world; p++) {
+                if (p != state.rank && !state.peers[p]->recv_data(state.recv_buf.data() + (size_t) p*nbytes, nbytes)) {
+                    return false;
+                }
+            }
+            int64_t t2 = g_rpc_trace.f ? rpc_trace::now_us() : 0;
+            memcpy(state.recv_buf.data() + (size_t) state.rank*nbytes, x, nbytes);
+            const float * parts = (const float *) state.recv_buf.data();
+            for (int64_t i = 0; i < ne; i++) {
+                float acc = parts[i];
+                for (uint32_t p = 1; p < state.world; p++) {
+                    acc += parts[(size_t) p*ne + i];
+                }
+                x[i] = acc;
+            }
+            if (g_rpc_trace.f) { tr_xchg = t2 - t1; tr_local = rpc_trace::now_us() - t2; }
+        } else {
+            state.recv_buf.resize(nbytes);
+            const float * y = (const float *) state.recv_buf.data();
+            for (uint32_t k = 1; k < state.world; k <<= 1) {
+                socket_t * peer = state.peers[state.rank ^ k].get();
+                int64_t t1 = g_rpc_trace.f ? rpc_trace::now_us() : 0;
+                if (!peer->send_data(x, nbytes) || !peer->flush() || !peer->recv_data(state.recv_buf.data(), nbytes)) {
+                    return false;
+                }
+                int64_t t2 = g_rpc_trace.f ? rpc_trace::now_us() : 0;
+                for (int64_t i = 0; i < ne; i++) {
+                    x[i] += y[i];
+                }
+                if (g_rpc_trace.f) { tr_xchg += t2 - t1; tr_local += rpc_trace::now_us() - t2; }
+            }
+        }
+        g_rpc_trace.set_detail("bytes=%zu algo=%s steps=%u wait_compute_us=%lld exchange_us=%lld local_us=%lld",
+            nbytes, ag ? "ag" : "rd", ag ? 1u : (unsigned) __builtin_ctz(state.world),
+            (long long) tr_sync, (long long) tr_xchg, (long long) tr_local);
+        return true;
+    }
+
     // reduce large partials in bf16 to halve the wire bytes; small (decode-sized) ones
     // stay f32 since the extra casts and sync cost more than the bytes saved
     const bool   wire_bf16  = t_dst->type == GGML_TYPE_F32 && ne >= 32768;
@@ -3085,9 +3150,17 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tenso
             return false;
         }
     }
+    // GGML_RPC_COMM_ALGO=rd|ag forces the small-payload algorithm on every rank (default: auto)
+    static const uint32_t comm_algo = [] {
+        const char * e = std::getenv("GGML_RPC_COMM_ALGO");
+        if (e != nullptr && strcmp(e, "rd") == 0) { return (uint32_t) RPC_COMM_ALGO_RD; }
+        if (e != nullptr && strcmp(e, "ag") == 0) { return (uint32_t) RPC_COMM_ALGO_AG; }
+        return (uint32_t) RPC_COMM_ALGO_AUTO;
+    }();
     for (size_t i = 0; i < n_ranks; i++) {
         auto request = std::make_shared<rpc_msg_comm_allreduce_req>();
         request->device = comm_ctx->ranks[i].device;
+        request->algo   = comm_algo;
         request->tensor = serialize_tensor(tensors[i]);
         comm_ctx->ranks[i].dispatcher->send_async(RPC_CMD_COMM_ALLREDUCE, request, sizeof(*request));
     }
